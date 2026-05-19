@@ -32,6 +32,7 @@ parameters.
 
 import copy
 import datetime
+import contextvars
 import json
 import logging
 import os
@@ -221,47 +222,80 @@ def _grant_mysql_master_user_privileges(host, port, master_user, master_pass, db
             db_id, e)
 
 
-def _wait_for_database_ready(host, port, engine, user, password, db_name, timeout=60):
-    """Block until the database accepts an authenticated connection.
-
-    TCP readiness is not enough for MySQL/Postgres images: they can accept a
-    socket before bootstrap has created users and databases. When a DB driver is
-    unavailable in the lightweight install, fall back to TCP readiness so RDS
-    control-plane behavior remains usable without optional dependencies.
+def _try_database_connect(host, port, engine, user, password, db_name):
+    """Single auth-probe attempt. Returns True on success, False on a
+    transient failure. TCP readiness alone is not enough for MySQL/Postgres
+    images — they accept sockets before bootstrap creates users/databases —
+    so we open and close an authenticated connection. When the DB driver
+    isn't installed (lightweight image) we fall back to a one-shot TCP check.
     """
-    deadline = time.time() + timeout
-    last_error = None
-    while time.time() < deadline:
-        try:
-            if _is_mysql_engine(engine):
-                try:
-                    import pymysql
-                except ImportError:
-                    return _wait_for_port(host, port, timeout=max(1, deadline - time.time()))
-                conn = pymysql.connect(
-                    host=host, port=int(port), user="root",
-                    password=password, database=db_name or None,
-                    connect_timeout=2, read_timeout=2, write_timeout=2,
-                    autocommit=True)
-            elif _is_postgres_engine(engine):
-                try:
-                    import psycopg2
-                except ImportError:
-                    return _wait_for_port(host, port, timeout=max(1, deadline - time.time()))
-                conn = psycopg2.connect(
-                    host=host, port=int(port), user=user,
-                    password=password, dbname=db_name or "postgres",
-                    connect_timeout=2)
-            else:
-                return _wait_for_port(host, port, timeout=max(1, deadline - time.time()))
-            conn.close()
+    try:
+        if _is_mysql_engine(engine):
+            try:
+                import pymysql
+            except ImportError:
+                return _wait_for_port(host, port, timeout=1)
+            conn = pymysql.connect(
+                host=host, port=int(port), user="root",
+                password=password, database=db_name or None,
+                connect_timeout=2, read_timeout=2, write_timeout=2,
+                autocommit=True)
+        elif _is_postgres_engine(engine):
+            try:
+                import psycopg2
+            except ImportError:
+                return _wait_for_port(host, port, timeout=1)
+            conn = psycopg2.connect(
+                host=host, port=int(port), user=user,
+                password=password, dbname=db_name or "postgres",
+                connect_timeout=2)
+        else:
+            return _wait_for_port(host, port, timeout=1)
+        conn.close()
+        return True
+    except Exception as e:
+        # Distinguish *permanent* auth failures from transient boot-time errors.
+        # A transient failure (server still starting, socket refused, etc.) is
+        # expected during the readiness loop. A permanent auth failure means
+        # the container's image is configured with a different password than
+        # the one ministack handed it — the loop would spin forever and the
+        # user would see nothing. Surface that case at WARNING level with a
+        # concrete hint so it shows up in ministack logs.
+        msg = str(e)
+        is_auth_denied = (
+            # pymysql: OperationalError with MySQL error code 1045
+            (getattr(e, "args", None) and isinstance(e.args[0], int) and e.args[0] == 1045)
+            # psycopg2 and generic driver messages
+            or "password authentication failed" in msg.lower()
+            or "access denied for user" in msg.lower()
+        )
+        if is_auth_denied:
+            logger.warning(
+                "RDS: authentication denied probing %s:%s — the container's "
+                "image is configured with a different password than ministack "
+                "passed at start-up. The instance will stay in `creating` until "
+                "the container exits. Driver error: %s",
+                host, port, msg,
+            )
+        else:
+            logger.debug("RDS: readiness probe transient failure: %s", e)
+        return False
+
+
+def _wait_for_database_ready(host, port, engine, user, password, db_name,
+                             is_container_alive):
+    """Poll until the database accepts an authenticated connection. No wall
+    clock — real AWS `CreateDBInstance` has no caller-visible timeout, so
+    neither do we. The loop terminates on success or when the backing
+    container stops being alive (mirrors how real RDS flips an instance to
+    `failed` based on hardware state, not a fixed deadline).
+    """
+    while True:
+        if not is_container_alive():
+            return False
+        if _try_database_connect(host, port, engine, user, password, db_name):
             return True
-        except Exception as e:
-            last_error = e
-            time.sleep(0.5)
-    if last_error:
-        logger.debug("RDS: database readiness check failed: %s", last_error)
-    return False
+        time.sleep(0.5)
 
 
 def _refresh_cluster_status(cluster_id):
@@ -654,14 +688,63 @@ def _create_db_instance(p):
     _register_instance_in_cluster(instance)
 
     if real_container_started:
+        # Real AWS CreateDBInstance returns immediately with status="creating"
+        # and the caller polls (or uses get_waiter('db_instance_available'))
+        # until the database becomes reachable. Do the same: run the readiness
+        # wait + grant on a daemon thread so the request handler returns now.
+        #
+        # contextvars.copy_context() carries the request's account_id into
+        # the daemon — _instances is account-scoped, so without the snapshot
+        # the worker would look the instance up under the default account
+        # and silently fail to flip status to "available".
         ready_host = readiness_host or endpoint_host
         ready_port = readiness_port or endpoint_port
-        if _wait_for_database_ready(
-            ready_host, ready_port, engine, master_user, master_pass, db_name):
+        ctx = contextvars.copy_context()
+
+        def _bg_finalize_ready(
+            db_id=db_id, cluster_id=cluster_id, engine=engine,
+            master_user=master_user, master_pass=master_pass,
+            db_name=db_name, ready_host=ready_host, ready_port=ready_port,
+            ms_network=ms_network, internal_host=internal_host,
+            internal_port=internal_port, endpoint_port=endpoint_port,
+            container_id=docker_container_id,
+        ):
+            # Tie readiness to backing-container liveness rather than a wall
+            # clock: real RDS `CreateDBInstance` has no caller-visible timeout
+            # and flips status to `failed` based on hardware state. We do the
+            # same — instance stays `creating` while the container is up and
+            # booting, transitions to `failed` if the container dies before
+            # accepting an authenticated connection.
+            def _container_alive():
+                client = _get_docker()
+                if not client or not container_id:
+                    return True  # control-plane-only — nothing to monitor
+                try:
+                    c = client.containers.get(container_id)
+                    c.reload()
+                    return c.status not in ("exited", "dead", "removing")
+                except Exception:
+                    return False
+            if not _wait_for_database_ready(
+                ready_host, ready_port, engine, master_user,
+                master_pass, db_name, _container_alive,
+            ):
+                logger.warning(
+                    "RDS: %s container for %s at %s:%s exited before becoming reachable",
+                    engine, db_id, ready_host, ready_port,
+                )
+                inst = _instances.get(db_id)
+                if inst is not None:
+                    inst["DBInstanceStatus"] = "failed"
+                _refresh_cluster_status(cluster_id)
+                return
             if _is_mysql_engine(engine):
                 _grant_mysql_master_user_privileges(
-                    ready_host, ready_port, master_user, master_pass, db_id)
-            instance["DBInstanceStatus"] = "available"
+                    ready_host, ready_port, master_user, master_pass, db_id,
+                )
+            inst = _instances.get(db_id)
+            if inst is not None:
+                inst["DBInstanceStatus"] = "available"
             if cluster_id:
                 cluster = _clusters.get(cluster_id)
                 if cluster:
@@ -670,15 +753,17 @@ def _create_db_instance(p):
             if ms_network and internal_host:
                 logger.info(
                     "RDS: %s container for %s ready at %s:%s (network %s)",
-                    engine, db_id, internal_host, internal_port, ms_network)
+                    engine, db_id, internal_host, internal_port, ms_network,
+                )
             else:
                 logger.info(
                     "RDS: %s container for %s ready on port %s",
-                    engine, db_id, endpoint_port)
-        else:
-            logger.warning(
-                "RDS: %s container for %s at %s:%s not ready after timeout",
-                engine, db_id, ready_host, ready_port)
+                    engine, db_id, endpoint_port,
+                )
+
+        threading.Thread(
+            target=ctx.run, args=(_bg_finalize_ready,), daemon=True,
+        ).start()
 
     req_tags = _parse_tags(p)
     if req_tags:
