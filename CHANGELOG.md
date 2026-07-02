@@ -5,6 +5,18 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **State — on-demand save and named checkpoints via `/_ministack/state/*` admin endpoints** — `POST /_ministack/state/save` flushes all in-memory service state to `STATE_DIR` immediately; `POST /_ministack/state/checkpoint {"name": ...}` saves a named snapshot under `${STATE_DIR}/checkpoints/<name>/` (per-service state files, Lambda code blobs as hardlinked copies so Lambda's orphan-blob prune can't corrupt a checkpoint, and S3 object data when `S3_PERSIST=1`); `POST /_ministack/state/restore {"name": ...}` hot-restores a snapshot into the running instance without a restart (in-memory reset, file swap, per-service restore, pollers/schedulers restarted — same semantics as a process restart: RUNNING Step Functions executions become `FAILED`/`States.ServiceRestart`, open API Gateway WebSocket connections are closed); `GET /_ministack/state/checkpoints` lists and `DELETE /_ministack/state/checkpoints/<name>` removes them. The endpoints work regardless of `PERSIST_STATE` — that flag keeps governing only the automatic boot-restore/shutdown-save cycle — and named checkpoints survive `/_ministack/reset`, so snapshot → reset → restore works as a test-isolation workflow.
+- **Persistence — `PERSIST_INTERVAL` periodic autosave** — opt-in (seconds, default `0` = off, requires `PERSIST_STATE=1`): a background task saves all service state every N seconds, so a crash, OOM kill, or `SIGKILL` — which no shutdown hook can catch — loses at most one interval of state instead of everything since the last clean shutdown.
+
+### Fixed
+- **Persistence — state is flushed on `SIGTERM`/`docker stop` even when the ASGI lifespan shutdown doesn't run** — the `SIGTERM` handler installed by `python -m ministack` calls `sys.exit(0)` directly, which could bypass hypercorn's graceful lifespan shutdown and silently drop all state on `docker stop`. An `atexit` safety net now performs the final save whenever `PERSIST_STATE=1` and the lifespan shutdown save hasn't already run.
+- **Reset — `/_ministack/reset` wipes persisted state files unconditionally and removes orphaned Lambda code blobs** — the file wipe was gated on `PERSIST_STATE`, so state files written by the explicit save endpoint with the gate off survived a reset and could be resurrected into a later checkpoint; and `lambda-blobs/` was never cleaned, leaking orphaned code blobs after every reset until the next Lambda save. Reset now always removes `${STATE_DIR}/*.json` and `${STATE_DIR}/lambda-blobs/` (named checkpoints under `${STATE_DIR}/checkpoints/` are preserved).
+
+---
+
 ## [1.3.70] — 2026-06-30
 
 ### Added

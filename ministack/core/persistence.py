@@ -105,3 +105,89 @@ def save_all(services: dict) -> None:
             save_state(name, get_state())
         except Exception as e:
             logger.error("Persistence: error getting state for %s: %s", name, e)
+
+
+# ---------------------------------------------------------------------------
+# Ungated, path-parameterized primitives. Unlike save_state/load_state these
+# do NOT check PERSIST_STATE — they back explicit, on-demand operations
+# (admin save endpoint, named checkpoints) where the user has already asked
+# for the write. STATE_DIR is intentionally not baked in so checkpoints can
+# write the same file format into their own directories.
+# ---------------------------------------------------------------------------
+
+
+def write_state_file(dir_path: str, service: str, data: dict) -> str:
+    """Atomically write ``data`` to ``<dir_path>/<service>.json``. Raises on failure."""
+    os.makedirs(dir_path, exist_ok=True)
+    path = os.path.join(dir_path, f"{service}.json")
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f, default=_json_default)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def read_state_file(dir_path: str, service: str) -> dict | None:
+    """Read ``<dir_path>/<service>.json``; None if absent or unreadable."""
+    path = os.path.join(dir_path, f"{service}.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f, object_hook=_json_object_hook)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error("Persistence: failed to read %s: %s", path, e)
+        return None
+
+
+_GET_STATE_ATTEMPTS = 3
+
+
+def get_state_with_retry(name: str, get_state):
+    """Call ``get_state()``, retrying on RuntimeError.
+
+    get_state() deep-copies live stores; a request mutating a store
+    mid-copy raises RuntimeError ("dictionary changed size during
+    iteration"). The stores are consistent between requests, so an
+    immediate retry almost always succeeds. Returns None when state
+    could not be captured."""
+    for attempt in range(_GET_STATE_ATTEMPTS):
+        try:
+            return get_state()
+        except RuntimeError as e:
+            if attempt == _GET_STATE_ATTEMPTS - 1:
+                logger.error(
+                    "Persistence: error getting state for %s after %d attempts: %s",
+                    name, _GET_STATE_ATTEMPTS, e,
+                )
+        except Exception as e:
+            logger.error("Persistence: error getting state for %s: %s", name, e)
+            return None
+    return None
+
+
+def save_all_resilient(services: dict) -> int:
+    """Save all service states to STATE_DIR regardless of PERSIST_STATE,
+    retrying snapshots that race with in-flight requests. Backs the
+    explicit /_ministack/state/save endpoint and the autosave loop.
+    Returns the number of services saved."""
+    saved = 0
+    for name, get_state in services.items():
+        data = get_state_with_retry(name, get_state)
+        if data is None:
+            continue
+        try:
+            path = write_state_file(STATE_DIR, name, data)
+        except Exception as e:
+            logger.error("Persistence: failed to save %s: %s", name, e)
+            continue
+        logger.info("Persistence: saved %s state to %s", name, path)
+        saved += 1
+    return saved

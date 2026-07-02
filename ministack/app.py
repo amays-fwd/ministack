@@ -7,6 +7,7 @@ Compatible with AWS CLI, boto3, and any AWS SDK via --endpoint-url.
 
 import argparse
 import asyncio
+import atexit
 import base64
 import json
 import logging
@@ -980,6 +981,155 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
     return 200, {"Content-Type": "application/json"}, json.dumps({"applied": applied}).encode()
 
 
+def _restore_checkpoint_locked(name: str) -> list[str]:
+    """Hot-restore a named checkpoint into the running process.
+
+    Caller must hold the reset lock; runs in a worker thread via
+    asyncio.to_thread. Sequence matters: reset in-memory state first
+    (restore paths merge via .update(), they don't replace), then swap the
+    on-disk files (before any lazy import, so a module whose bottom-of-file
+    load_state() fires under PERSIST_STATE=1 sees checkpoint data), then
+    explicitly apply each service's restore path — import-time self-restore
+    only runs once per process, so already-imported modules (and every
+    module when PERSIST_STATE=0) need the explicit call.
+    """
+    from ministack.core import checkpoints, persistence
+
+    # Fail before touching anything if the checkpoint doesn't exist.
+    checkpoints.require_checkpoint(name)
+
+    _reset_in_memory_state()
+    restored_keys = checkpoints.restore_checkpoint_files(name)
+
+    applied = []
+    for key in restored_keys:
+        mod_name = _state_map.get(key)
+        if mod_name is None:
+            logger.warning("restore %r: unknown state key %r — skipping", name, key)
+            continue
+        data = persistence.read_state_file(persistence.STATE_DIR, key)
+        if not data:
+            continue
+        mod = _get_module(mod_name)
+        # A freshly imported module may have already self-restored from the
+        # checkpoint files (PERSIST_STATE=1); re-applying is harmless because
+        # every restore path merges idempotently.
+        restore_fn = getattr(mod, "load_persisted_state", None) or getattr(mod, "restore_state", None)
+        if restore_fn is None:
+            logger.warning("restore %r: %s has no restore path — skipping", name, mod_name)
+            continue
+        try:
+            restore_fn(data)
+            applied.append(key)
+        except Exception as e:
+            logger.warning("restore %r: failed to restore %s: %s", name, key, e)
+
+    # Belt-and-braces: the EventBridge scheduler daemon survives reset, but
+    # start_scheduler() is idempotent and covers the case where the module
+    # was imported for the first time during this restore.
+    try:
+        from ministack.services import eventbridge as _eb_mod
+        _eb_mod.start_scheduler()
+    except Exception as e:
+        logger.warning("restore %r: EventBridge scheduler restart failed: %s", name, e)
+
+    return applied
+
+
+async def _handle_admin_state_request(method: str, path: str, body: bytes):
+    """Admin state endpoints: on-demand save, named checkpoints, hot restore.
+
+    These work regardless of PERSIST_STATE — the env gate governs only the
+    automatic boot-restore/shutdown-save cycle, while these are explicit
+    user actions. All mutating routes take the reset lock, which both
+    serializes against /_ministack/reset and gates admission of new
+    requests, giving a near-quiescent snapshot.
+    """
+    if not path.startswith("/_ministack/state/"):
+        return None
+
+    from ministack.core import checkpoints, persistence
+
+    def _json_resp(status: int, payload: dict):
+        return status, {"Content-Type": "application/json"}, json.dumps(payload).encode()
+
+    def _body_name():
+        try:
+            req = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            req = {}
+        return req if isinstance(req, dict) else {}
+
+    if path == "/_ministack/state/save" and method == "POST":
+        async with _get_reset_lock():
+            saved = await asyncio.to_thread(
+                persistence.save_all_resilient, _build_persistence_save_dict()
+            )
+        payload = {
+            "saved": True,
+            "services": saved,
+            "state_dir": persistence.STATE_DIR,
+            "autoload": persistence.PERSIST_STATE,
+        }
+        if not persistence.PERSIST_STATE:
+            payload["note"] = (
+                "PERSIST_STATE is not enabled — saved state will not be loaded "
+                "automatically at next boot. Use /_ministack/state/restore or "
+                "start with PERSIST_STATE=1."
+            )
+        return _json_resp(200, payload)
+
+    if path == "/_ministack/state/checkpoint" and method == "POST":
+        req = _body_name()
+        name = req.get("name")
+        try:
+            checkpoints.validate_name(name)
+        except checkpoints.InvalidCheckpointNameError as e:
+            return _json_resp(400, {"error": str(e)})
+        try:
+            async with _get_reset_lock():
+                manifest = await asyncio.to_thread(
+                    checkpoints.create_checkpoint,
+                    name,
+                    _build_persistence_save_dict(),
+                    overwrite=bool(req.get("overwrite", False)),
+                )
+        except checkpoints.CheckpointExistsError as e:
+            return _json_resp(409, {"error": str(e)})
+        return _json_resp(200, manifest)
+
+    if path == "/_ministack/state/restore" and method == "POST":
+        name = _body_name().get("name")
+        try:
+            checkpoints.validate_name(name)
+        except checkpoints.InvalidCheckpointNameError as e:
+            return _json_resp(400, {"error": str(e)})
+        try:
+            async with _get_reset_lock():
+                applied = await asyncio.to_thread(_restore_checkpoint_locked, name)
+        except checkpoints.CheckpointNotFoundError as e:
+            return _json_resp(404, {"error": str(e)})
+        return _json_resp(200, {"restored": True, "name": name, "services": len(applied)})
+
+    if path == "/_ministack/state/checkpoints" and method == "GET":
+        cps = await asyncio.to_thread(checkpoints.list_checkpoints)
+        return _json_resp(200, {"checkpoints": cps})
+
+    if path.startswith("/_ministack/state/checkpoints/") and method == "DELETE":
+        name = path[len("/_ministack/state/checkpoints/"):]
+        try:
+            checkpoints.validate_name(name)
+        except checkpoints.InvalidCheckpointNameError as e:
+            return _json_resp(400, {"error": str(e)})
+        try:
+            await asyncio.to_thread(checkpoints.delete_checkpoint, name)
+        except checkpoints.CheckpointNotFoundError as e:
+            return _json_resp(404, {"error": str(e)})
+        return _json_resp(200, {"deleted": True, "name": name})
+
+    return None
+
+
 async def _handle_post_body_shortcuts(method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str):
     """Handle body-dependent routes before the generic service router."""
     # CloudFormation custom resource ResponseURL intercept
@@ -1000,6 +1150,9 @@ async def _handle_post_body_shortcuts(method: str, path: str, headers: dict, bod
     if response is not None:
         # See _handle_pre_body_request: browser-based OIDC clients need CORS.
         return _with_data_plane_headers(response, request_id)
+    response = await _handle_admin_state_request(method, path, body)
+    if response is not None:
+        return response
     return await _handle_admin_config_request(path, method, body)
 
 
@@ -1810,10 +1963,21 @@ async def _handle_lifespan(scope, receive, send):
             for svc in SERVICE_HANDLERS:
                 logger.debug("%s init completed.", svc.capitalize())
             asyncio.create_task(_run_ready_scripts())
+            _start_autosave_task()
         elif message["type"] == "lifespan.shutdown":
             logger.info("MiniStack shutting down...")
+            # Stop the autosave loop before the final save so they can't
+            # interleave.
+            if _autosave_task is not None:
+                _autosave_task.cancel()
+                try:
+                    await _autosave_task
+                except asyncio.CancelledError:
+                    pass
             if PERSIST_STATE:
                 save_all(_build_persistence_save_dict())
+                global _final_save_done
+                _final_save_done = True
             try:
                 from ministack.services import transfer
 
@@ -1876,6 +2040,77 @@ def _build_persistence_save_dict():
                 continue
         save_dict[key] = mod.get_state
     return save_dict
+
+
+# Set once the lifespan shutdown save has run, so the atexit safety net
+# below doesn't redo the work (a double save would be harmless — atomic
+# rewrite of identical content — just redundant).
+_final_save_done = False
+
+
+def _final_save():
+    """atexit safety net: flush state when the process exits without the
+    ASGI lifespan shutdown save having run. The SIGTERM handler installed
+    by main() calls sys.exit(0) directly, which raises SystemExit and runs
+    atexit handlers — but may bypass hypercorn's graceful lifespan
+    shutdown entirely, silently dropping all state on `docker stop`.
+    SIGKILL/OOM remains uncatchable; PERSIST_INTERVAL autosave covers that."""
+    global _final_save_done
+    from ministack.core import persistence
+
+    if _final_save_done or not persistence.PERSIST_STATE:
+        return
+    _final_save_done = True
+    try:
+        save_all(_build_persistence_save_dict())
+        logger.info("Final state save completed (atexit)")
+    except Exception as e:
+        logger.error("Final state save failed: %s", e)
+
+
+atexit.register(_final_save)
+
+
+_autosave_task: "asyncio.Task | None" = None
+
+
+def _persist_interval() -> float:
+    raw = os.environ.get("PERSIST_INTERVAL", "0")
+    try:
+        return float(raw or 0)
+    except ValueError:
+        logger.warning("Invalid PERSIST_INTERVAL=%r — autosave disabled", raw)
+        return 0.0
+
+
+def _start_autosave_task():
+    """Start the periodic autosave loop when PERSIST_STATE=1 and
+    PERSIST_INTERVAL > 0. Covers crash/SIGKILL, which no shutdown hook
+    can — state is at most one interval stale."""
+    global _autosave_task
+    from ministack.core import persistence
+
+    interval = _persist_interval()
+    if not (persistence.PERSIST_STATE and interval > 0):
+        return
+    _autosave_task = asyncio.create_task(_autosave_loop(interval))
+    logger.info("Autosave enabled: every %gs to %s", interval, persistence.STATE_DIR)
+
+
+async def _autosave_loop(interval: float):
+    from ministack.core import persistence
+
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            async with _get_reset_lock():
+                await asyncio.to_thread(
+                    persistence.save_all_resilient, _build_persistence_save_dict()
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Autosave failed")
 
 
 def _load_persisted_state():
@@ -2090,10 +2325,10 @@ def _run_init_scripts():
             logger.error("Failed to execute init script %s: %s", script_path, e)
 
 
-def _reset_all_state():
-    """Wipe all in-memory state across every service module, and persisted files if enabled."""
-
-    from ministack.core.persistence import PERSIST_STATE, STATE_DIR
+def _reset_in_memory_state():
+    """Run every imported service module's reset(). Shared by
+    /_ministack/reset (which also wipes persisted files) and checkpoint
+    hot-restore (which replaces the files instead)."""
 
     # Stateful modules that don't have a routing entry in SERVICE_REGISTRY but
     # still need reset() — REST API v1 (served via the apigateway module),
@@ -2122,18 +2357,44 @@ def _reset_all_state():
         except Exception as e:
             logger.warning("reset() failed for %s: %s", mod_name, e)
 
+
+def _reset_all_state():
+    """Wipe all in-memory state across every service module, and persisted files."""
+
+    from ministack.core.persistence import STATE_DIR
+
+    _reset_in_memory_state()
+
     S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
     S3_PERSIST = os.environ.get("S3_PERSIST", "0") == "1"
 
-    # Wipe persisted files so a subsequent restart doesn't reload old state
-    if PERSIST_STATE and os.path.isdir(STATE_DIR):
+    # Wipe persisted files so neither a restart nor a later checkpoint can
+    # resurrect pre-reset state. Deliberately NOT gated on PERSIST_STATE:
+    # the explicit /_ministack/state/save endpoint writes these files even
+    # with the gate off, and a file surviving reset gets captured into the
+    # next checkpoint by the unloaded-module fallback in
+    # checkpoints.create_checkpoint(). Named checkpoints
+    # (STATE_DIR/checkpoints/) intentionally survive reset — snapshot →
+    # reset → restore is a primary workflow; remove them via
+    # DELETE /_ministack/state/checkpoints/<name>.
+    if os.path.isdir(STATE_DIR):
+        wiped = False
         for fname in os.listdir(STATE_DIR):
             if fname.endswith(".json"):
                 try:
                     os.remove(os.path.join(STATE_DIR, fname))
+                    wiped = True
                 except Exception as e:
                     logger.warning("reset: failed to remove %s: %s", fname, e)
-        logger.info("Wiped persisted state files in %s", STATE_DIR)
+        # Lambda code blobs: with lambda.json gone every blob is an orphan.
+        # Without this they leak until the next Lambda save's orphan prune,
+        # which never runs if Lambda isn't used again.
+        blob_dir = os.path.join(STATE_DIR, "lambda-blobs")
+        if os.path.isdir(blob_dir):
+            shutil.rmtree(blob_dir, ignore_errors=True)
+            wiped = True
+        if wiped:
+            logger.info("Wiped persisted state files in %s", STATE_DIR)
 
     if S3_PERSIST and os.path.isdir(S3_DATA_DIR):
         for entry in os.listdir(S3_DATA_DIR):

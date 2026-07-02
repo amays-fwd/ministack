@@ -698,6 +698,7 @@ end-to-end without any client config.
 | `MINISTACK_OPENSEARCH_ENDPOINT` | _(unset)_ | If set (e.g. `localhost:9200`), every domain returns this endpoint instead of spawning a per-domain container — useful when you bring your own cluster |
 | `PERSIST_STATE` | `0` | Set `1` to persist service state across restarts |
 | `STATE_DIR` | `/tmp/ministack-state` | Directory for persisted state files |
+| `PERSIST_INTERVAL` | `0` | Autosave period in seconds (requires `PERSIST_STATE=1`). `0` disables. Set e.g. `300` so a crash or `SIGKILL` loses at most that much state — shutdown-time saves can't catch those |
 | `LAMBDA_EXECUTOR` | `local` | Lambda execution mode: `local` (subprocess) or `docker` (container). `provided` runtimes and `PackageType: Image` always use Docker |
 | `LAMBDA_STRICT` | `0` | Set `1` for AWS-fidelity mode: every Lambda invocation runs in a Docker container via the AWS RIE image; in-process fallbacks are disabled. Missing Docker surfaces as `Runtime.DockerUnavailable` instead of degrading to a subprocess. Opt-in because the default install doesn't require Docker |
 | `LAMBDA_DOCKER_NETWORK` | _(unset)_ | Legacy alias for `DOCKER_NETWORK` (Lambda only). Prefer `DOCKER_NETWORK` which covers all services |
@@ -794,6 +795,29 @@ docker run -p 4566:4566 \
   -v /tmp/ministack-data:/data \
   ministackorg/ministack
 ```
+
+State is flushed on graceful shutdown (including `docker stop` / `SIGTERM`, via an atexit safety net). A crash or `SIGKILL` cannot be caught — set `PERSIST_INTERVAL` (seconds) to autosave periodically, or save on demand with the endpoint below.
+
+#### On-demand save and named checkpoints
+
+Admin endpoints for saving and restoring state programmatically — useful for snapshotting a seeded environment before a test run and rolling back afterwards. These work even without `PERSIST_STATE=1` (that flag only controls the automatic save/restore cycle at shutdown/boot):
+
+```bash
+# Flush current state to STATE_DIR right now
+curl -X POST localhost:4566/_ministack/state/save
+
+# Save a named snapshot (add "overwrite": true to replace an existing one)
+curl -X POST localhost:4566/_ministack/state/checkpoint -d '{"name": "seeded"}'
+
+# Hot-restore a snapshot into the running instance — no restart needed
+curl -X POST localhost:4566/_ministack/state/restore -d '{"name": "seeded"}'
+
+# List / delete checkpoints
+curl localhost:4566/_ministack/state/checkpoints
+curl -X DELETE localhost:4566/_ministack/state/checkpoints/seeded
+```
+
+Checkpoints live under `${STATE_DIR}/checkpoints/<name>/` and include Lambda code blobs and (when `S3_PERSIST=1`) S3 object data. They survive `POST /_ministack/reset` — reset wipes live state and persisted state files (regardless of `PERSIST_STATE`), but named checkpoints stay available, so snapshot → reset → restore works as a workflow. Hot-restore caveats: open API Gateway WebSocket connections are closed, RUNNING Step Functions executions are marked `FAILED` (`States.ServiceRestart`) — the same semantics as a process restart — and new requests are briefly held while the restore swaps state.
 
 ### Lambda in Docker
 
