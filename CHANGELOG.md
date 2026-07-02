@@ -5,6 +5,13 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **API Gateway v1 — custom (Lambda) authorizers enforced on the data plane, with authorizer context flowing into integrations** — methods with `authorizationType: CUSTOM` now invoke their TOKEN/REQUEST authorizer Lambda before the integration, matching AWS: a missing identity source returns `401 {"message": "Unauthorized"}` without invoking the Lambda, a Deny policy returns `403 {"message": "User is not authorized to access this resource"}`, invocation failures return AWS's `500 {"message": null}`, and results are cached per `authorizerResultTtlInSeconds` (0 disables; runtime-only, never persisted). On Allow, the authorizer's `context` (stringified, plus `principalId`) is populated as `requestContext.authorizer` on AWS_PROXY events and available as `context.authorizer.*` request-parameter sources. `_invoke_http_proxy_v1` now applies `integration.request.header.*` and `integration.request.querystring.*` requestParameters (previously only `integration.request.path.*`) from static literals, `method.request.{header,querystring,path}.*`, `stageVariables.*`, and `context.authorizer.*` sources, with mapped headers overriding inbound ones — so the common real-gateway pattern `integration.request.header.Authorization: context.authorizer.access_token` (a REQUEST authorizer minting an upstream bearer token from an API key) works end-to-end. Routes with `authorizationType: NONE`, and CUSTOM routes whose authorizer Lambda doesn't exist locally, keep passing through unchanged (fail-open with a warning — auth wiring is often a deploy-time concern in local previews).
+
+---
+
 ## [1.3.70] — 2026-06-30
 
 ### Added

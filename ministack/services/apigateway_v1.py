@@ -111,6 +111,12 @@ _base_path_mappings = AccountScopedDict()  # domain_name -> {base_path -> BasePa
 _v1_tags = AccountScopedDict()             # resource_arn -> {key -> value}
 _account_settings = AccountScopedDict()    # singleton per account: stores fields set via UpdateAccount
 
+# Custom-authorizer result cache, keyed by (account, api_id, authorizer_id,
+# identity-source values) with a per-authorizer TTL — mirrors API Gateway's
+# authorizer caching. Ephemeral runtime state: NOT persisted (a restart just
+# re-invokes the authorizer, like a real cache flush).
+_authorizer_cache: dict = {}
+
 
 # ---- Helpers ----
 
@@ -542,6 +548,169 @@ async def _call_lambda(func_name, event, qualifier=None):
     return lambda_response, None
 
 
+# ---- Custom (Lambda) authorizers ----
+
+def _auth_error(status, message):
+    return status, {"Content-Type": "application/json"}, json.dumps({"message": message}).encode()
+
+
+def _identity_sources(authorizer):
+    src = authorizer.get("identitySource") or "method.request.header.Authorization"
+    return [s.strip() for s in src.split(",") if s.strip()]
+
+
+def _extract_identity_values(sources, headers, query_params):
+    """Resolve identity-source expressions to their request values (None when absent)."""
+    values = []
+    for src in sources:
+        value = None
+        if src.startswith("method.request.header."):
+            value = headers.get(src[len("method.request.header."):].lower())
+            if isinstance(value, list):
+                value = value[-1] if value else None
+        elif src.startswith("method.request.querystring."):
+            value = (query_params or {}).get(src[len("method.request.querystring."):])
+            if isinstance(value, list):
+                value = value[0] if value else None
+        values.append(value)
+    return values
+
+
+def _stringify_authorizer_context(raw):
+    """Authorizer context values reach integrations stringified (AWS behavior:
+    only string/number/boolean are supported; booleans become 'true'/'false')."""
+    out = {}
+    for k, v in (raw.get("context") or {}).items():
+        if isinstance(v, bool):
+            out[str(k)] = "true" if v else "false"
+        elif isinstance(v, str):
+            out[str(k)] = v
+        else:
+            out[str(k)] = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
+    out["principalId"] = str(raw.get("principalId", ""))
+    return out
+
+
+async def _invoke_authorizer(authorizer, event):
+    """Invoke the authorizer Lambda; returns (raw_result, error, function_found).
+
+    Unlike ``_call_lambda`` this needs the function's RAW return value (the
+    IAM policy document), not an API-proxy-shaped response."""
+    from ministack.services import lambda_svc
+
+    uri = authorizer.get("authorizerUri", "")
+    tail = uri.split("function:")[-1].split("/")[0] if "function:" in uri else uri
+    func_name, qualifier = lambda_svc._resolve_name_and_qualifier(tail)
+    func_data, func_config = lambda_svc._get_func_record_for_qualifier(func_name, qualifier)
+    if func_data is None:
+        return None, f"authorizer Lambda '{func_name}' not found", False
+    exec_record = {"config": func_config, "code_zip": func_data.get("code_zip")}
+    result = await asyncio.to_thread(lambda_svc._execute_function, exec_record, event)
+    if result.get("error"):
+        return None, str(result.get("body") or "authorizer invocation error"), True
+    body = result.get("body")
+    if not isinstance(body, dict):
+        return None, "authorizer returned a non-object response", True
+    return body, None, True
+
+
+async def _run_custom_authorizer(api_id, stage_name, method, path, headers, query_params,
+                                 path_params, resource, stage, method_obj):
+    """Run the method's CUSTOM authorizer. Returns (auth_context, error_response).
+
+    Mirrors API Gateway: missing identity source -> 401 Unauthorized (without
+    invoking the Lambda); Deny policy -> 403; Lambda error / malformed policy
+    -> 500. Allow results (and denies) are cached per identity-source values
+    for authorizerResultTtlInSeconds. When the authorizer's Lambda does not
+    exist in ministack the request FAILS OPEN with a warning — auth wiring is
+    commonly a deploy-time concern in local previews, and hard-failing every
+    route would break previously-working setups."""
+    authorizer = (_authorizers_v1.get(api_id) or {}).get(method_obj.get("authorizerId"))
+    if not authorizer:
+        logger.warning("CUSTOM authorization on %s %s references unknown authorizer %r — allowing request",
+                       method, path, method_obj.get("authorizerId"))
+        return None, None
+    auth_type = (authorizer.get("type") or "TOKEN").upper()
+    if auth_type not in ("TOKEN", "REQUEST"):
+        return None, None  # COGNITO_USER_POOLS etc. are not emulated — pass through
+
+    try:
+        ttl = float(authorizer.get("authorizerResultTtlInSeconds", 300))
+    except (TypeError, ValueError):
+        ttl = 300.0
+
+    sources = _identity_sources(authorizer)
+    values = _extract_identity_values(sources, headers, query_params)
+    # TOKEN authorizers always require their identity source; REQUEST
+    # authorizers enforce presence only when caching is enabled (AWS behavior).
+    if any(v is None or v == "" for v in values) and (auth_type == "TOKEN" or ttl > 0):
+        return None, _auth_error(401, "Unauthorized")
+
+    cache_key = (get_account_id(), api_id, method_obj.get("authorizerId"), tuple(values))
+    if ttl > 0:
+        cached = _authorizer_cache.get(cache_key)
+        if cached and cached[0] > time.time():
+            auth_context = cached[1]
+            if auth_context is None:
+                return None, _auth_error(403, "User is not authorized to access this resource")
+            return auth_context, None
+        _authorizer_cache.pop(cache_key, None)
+
+    method_arn = (f"arn:aws:execute-api:{get_region()}:{get_account_id()}:"
+                  f"{api_id}/{stage_name}/{method}{path if path.startswith('/') else '/' + path}")
+    if auth_type == "TOKEN":
+        event = {"type": "TOKEN", "authorizationToken": values[0], "methodArn": method_arn}
+    else:
+        event = {
+            "type": "REQUEST",
+            "methodArn": method_arn,
+            "resource": resource["path"],
+            "path": path,
+            "httpMethod": method,
+            "headers": {k: v if isinstance(v, str) else v[-1] for k, v in headers.items()},
+            "multiValueHeaders": {k: [v] if isinstance(v, str) else list(v) for k, v in headers.items()},
+            "queryStringParameters": {k: v[0] if isinstance(v, list) else v
+                                      for k, v in (query_params or {}).items()} or None,
+            "multiValueQueryStringParameters": {k: list(v) if isinstance(v, list) else [v]
+                                                for k, v in (query_params or {}).items()} or None,
+            "pathParameters": path_params or None,
+            "stageVariables": (stage or {}).get("variables") or None,
+            "requestContext": {
+                "accountId": get_account_id(),
+                "apiId": api_id,
+                "stage": stage_name,
+                "httpMethod": method,
+                "path": f"/{stage_name}{path}",
+                "resourcePath": resource["path"],
+                "identity": {"sourceIp": headers.get("x-forwarded-for", "127.0.0.1").split(",")[0].strip()
+                             if isinstance(headers.get("x-forwarded-for", ""), str) else "127.0.0.1"},
+            },
+        }
+
+    raw, err, found = await _invoke_authorizer(authorizer, event)
+    if not found:
+        logger.warning("Custom authorizer for %s %s: %s — allowing request (auth wiring is "
+                       "typically a deploy-time concern in local previews)", method, path, err)
+        return None, None
+    if err or not isinstance(raw, dict):
+        logger.warning("Custom authorizer for %s %s failed: %s", method, path, err)
+        # AWS returns 500 {"message": null} for authorizer configuration/
+        # invocation failures.
+        return None, _auth_error(500, None)
+
+    statements = (raw.get("policyDocument") or {}).get("Statement") or []
+    effects = {str(s.get("Effect", "")).lower() for s in statements if isinstance(s, dict)}
+    if "allow" not in effects or "deny" in effects:
+        if ttl > 0:
+            _authorizer_cache[cache_key] = (time.time() + ttl, None)
+        return None, _auth_error(403, "User is not authorized to access this resource")
+
+    auth_context = _stringify_authorizer_context(raw)
+    if ttl > 0:
+        _authorizer_cache[cache_key] = (time.time() + ttl, auth_context)
+    return auth_context, None
+
+
 # ---- Persistence hooks ----
 
 def get_state():
@@ -602,6 +771,7 @@ def reset():
     _base_path_mappings.clear()
     _v1_tags.clear()
     _account_settings.clear()
+    _authorizer_cache.clear()
 
 
 # ---- Control plane router ----
@@ -904,6 +1074,20 @@ async def handle_execute(api_id, stage_name, method, path, headers, body, query_
     if not integration:
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": "No integration configured"}).encode()
 
+    # Run the method's CUSTOM (Lambda) authorizer before the integration, like
+    # real API Gateway: 401 when the identity source is missing, 403 on Deny,
+    # and on Allow the returned context flows to the integration — as
+    # requestContext.authorizer for AWS_PROXY and as a `context.authorizer.*`
+    # mapping source for HTTP_PROXY requestParameters.
+    auth_context = None
+    if method_obj.get("authorizationType") == "CUSTOM" and method_obj.get("authorizerId"):
+        auth_context, auth_err = await _run_custom_authorizer(
+            api_id, stage_name, method, path, headers, query_params,
+            path_params, resource, stage, method_obj,
+        )
+        if auth_err:
+            return auth_err
+
     int_type = integration.get("type", "")
 
     if int_type in ("AWS_PROXY", "AWS"):
@@ -911,10 +1095,12 @@ async def handle_execute(api_id, stage_name, method, path, headers, body, query_
             integration, api_id, stage_name, stage, resource, path, method,
             headers, body, query_params, path_params,
             binary_media_types=api.get("binaryMediaTypes") or [],
+            auth_context=auth_context,
         )
     elif int_type in ("HTTP_PROXY", "HTTP"):
         return await _invoke_http_proxy_v1(
-            integration, path, method, headers, body, query_params, path_params
+            integration, path, method, headers, body, query_params, path_params,
+            auth_context=auth_context, stage_variables=stage.get("variables"),
         )
     elif int_type == "MOCK":
         return _invoke_mock_v1(integration)
@@ -941,7 +1127,7 @@ def _media_type_matches(media_type, binary_media_types):
     return False
 
 
-async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resource, request_path, method, headers, body, query_params, path_params, binary_media_types=None):
+async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resource, request_path, method, headers, body, query_params, path_params, binary_media_types=None, auth_context=None):
     """Invoke Lambda with API Gateway v1 payload format 1.0."""
     uri = integration.get("uri", "")
     # Supported URI formats:
@@ -1013,6 +1199,8 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
         "body": req_body,
         "isBase64Encoded": req_is_base64,
     }
+    if auth_context:
+        event["requestContext"]["authorizer"] = auth_context
 
     lambda_response, err = await _call_lambda(func_name, event, qualifier=qualifier)
     if err:
@@ -1062,44 +1250,79 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
     return status, resp_headers, resp_body
 
 
-async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_params, path_params=None):
+async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_params, path_params=None, auth_context=None, stage_variables=None):
     """Forward a request to an HTTP backend."""
     uri = integration.get("uri", "")
     req_params = integration.get("requestParameters", {})
     path_params = path_params or {}
 
+    def _resolve_mapping_source(src):
+        """Resolve a requestParameters source expression to a value (None when
+        the source is absent). Supports static 'literals',
+        method.request.{path,header,querystring}.*, stageVariables.*, and
+        context.authorizer.* (the custom authorizer's returned context — how
+        real gateways inject e.g. an upstream Authorization header from an
+        access token the authorizer minted)."""
+        if not isinstance(src, str):
+            return None
+        if src.startswith("'") and src.endswith("'"):
+            return src[1:-1]
+        if src.startswith("method.request.path."):
+            return path_params.get(src[len("method.request.path."):])
+        if src.startswith("method.request.header."):
+            value = headers.get(src[len("method.request.header."):].lower())
+            if isinstance(value, list):
+                value = value[-1] if value else None
+            return value
+        if src.startswith("method.request.querystring."):
+            value = (query_params or {}).get(src[len("method.request.querystring."):])
+            if isinstance(value, list):
+                value = value[0] if value else None
+            return value
+        if src.startswith("context.authorizer."):
+            return (auth_context or {}).get(src[len("context.authorizer."):])
+        if src.startswith("stageVariables."):
+            return (stage_variables or {}).get(src[len("stageVariables."):])
+        return None
+
+    header_overrides = {}
+    query_appends = []
     for dest, src in req_params.items():
-        if not dest.startswith("integration.request.path."):
-            continue
-
-        placeholder = "{" + dest[len("integration.request.path."):] + "}"
-        value = ""
-        if isinstance(src, str):
-            if src.startswith("'") and src.endswith("'"):
-                value = src[1:-1]
-            elif src.startswith("method.request.path."):
-                value = path_params.get(src[len("method.request.path."):], "")
-
-        uri = uri.replace(placeholder, value)
+        if dest.startswith("integration.request.path."):
+            placeholder = "{" + dest[len("integration.request.path."):] + "}"
+            uri = uri.replace(placeholder, _resolve_mapping_source(src) or "")
+        elif dest.startswith("integration.request.header."):
+            value = _resolve_mapping_source(src)
+            if value is not None:
+                header_overrides[dest[len("integration.request.header."):]] = value
+        elif dest.startswith("integration.request.querystring."):
+            value = _resolve_mapping_source(src)
+            if value is not None:
+                query_appends.append((dest[len("integration.request.querystring."):], value))
 
     if "{proxy}" in uri:
         uri = uri.replace("{proxy}", path_params.get("proxy", ""))
 
+    flat_query = []
     if query_params:
-        flat_query = []
         for key, value in query_params.items():
             values = value if isinstance(value, list) else [value]
             for item in values:
                 flat_query.append((key, item))
-
+    flat_query.extend(query_appends)
+    if flat_query:
         query_string = urllib.parse.urlencode(flat_query)
         if query_string:
             uri = uri + ("&" if "?" in uri else "?") + query_string
 
     req = urllib.request.Request(uri, data=body or None, method=method)
+    override_names = {k.lower() for k in header_overrides}
     for k, v in headers.items():
-        if k.lower() not in ("host", "content-length"):
+        # Mapped headers replace the inbound value (AWS overwrite semantics).
+        if k.lower() not in ("host", "content-length") and k.lower() not in override_names:
             req.add_header(k, v)
+    for k, v in header_overrides.items():
+        req.add_header(k, v)
     try:
         status, resp_headers_raw, resp_body = await _urlopen_async(req, _PROXY_TIMEOUT_SECONDS)
         resp_headers = {"Content-Type": resp_headers_raw.get("Content-Type", "application/json")}

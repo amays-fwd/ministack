@@ -2113,3 +2113,345 @@ def test_apigateway_v1_create_domain_name_default_tls_policy(apigw_v1):
         certificateName="c2",
     )
     assert r["securityPolicy"] == "TLS_1_2"
+
+
+# ---- Custom (Lambda) authorizer data plane ----
+#
+# Real AWS runs the method's CUSTOM authorizer Lambda before the integration,
+# enforces 401 (missing identity source) / 403 (Deny policy), and exposes the
+# authorizer's returned context to the integration — both as
+# requestContext.authorizer on AWS_PROXY events and as a `context.authorizer.*`
+# source for `integration.request.header.*` request-parameter mappings on
+# HTTP_PROXY. Gateways that inject an upstream Authorization header from
+# authorizer context depend on the whole chain.
+
+
+def _v1_authz_policy(effect, context=None, principal="user-1"):
+    doc = {
+        "principalId": principal,
+        "policyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Action": "execute-api:Invoke", "Effect": effect, "Resource": "*"}
+            ],
+        },
+    }
+    if context is not None:
+        doc["context"] = context
+    return doc
+
+
+def _v1_build_authz_api(apigw_v1_mod, *, auth_type="TOKEN",
+                        identity_source="method.request.header.Authorization",
+                        ttl=300, integration=None, request_parameters=None,
+                        authorization_type="CUSTOM"):
+    status, _h, body = apigw_v1_mod._create_rest_api({"name": f"v1-authz-{_uuid_mod.uuid4().hex[:6]}"})
+    assert status == 201
+    api_id = json.loads(body)["id"]
+    status, _h, body = apigw_v1_mod._get_resources(api_id, {})
+    root = next(r for r in json.loads(body)["item"] if r["path"] == "/")
+    status, _h, body = apigw_v1_mod._create_authorizer(api_id, {
+        "name": "authz",
+        "type": auth_type,
+        "authorizerUri": ("arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+                          "arn:aws:lambda:us-east-1:000000000000:function:authz-fn/invocations"),
+        "identitySource": identity_source,
+        "authorizerResultTtlInSeconds": ttl,
+    })
+    assert status == 201
+    auth_id = json.loads(body)["id"]
+    status, _h, _b = apigw_v1_mod._put_method(api_id, root["id"], "GET", {
+        "authorizationType": authorization_type, "authorizerId": auth_id,
+    })
+    assert status == 201
+    status, _h, _b = apigw_v1_mod._put_integration(api_id, root["id"], "GET", integration or {
+        "type": "HTTP_PROXY", "httpMethod": "GET",
+        "uri": "http://upstream.test/backend",
+        "requestParameters": request_parameters or {},
+    })
+    assert status == 201
+    status, _h, _b = apigw_v1_mod._create_deployment(api_id, {"stageName": "test"})
+    assert status == 201
+    return api_id
+
+
+def _v1_execute(apigw_v1_mod, api_id, headers, path="/", query=None):
+    import asyncio
+    return asyncio.run(apigw_v1_mod.handle_execute(api_id, "test", "GET", path, headers, b"", query or {}))
+
+
+def test_apigwv1_token_authorizer_missing_identity_source_401(monkeypatch):
+    from ministack.services import apigateway_v1 as apigw_v1_mod
+
+    calls = []
+
+    async def fake_invoke(authorizer, event):
+        calls.append(event)
+        return _v1_authz_policy("Allow"), None, True
+
+    monkeypatch.setattr(apigw_v1_mod, "_invoke_authorizer", fake_invoke)
+    api_id = _v1_build_authz_api(apigw_v1_mod)
+    try:
+        status, _h, body = _v1_execute(apigw_v1_mod, api_id, {"host": "test"})
+        assert status == 401
+        assert json.loads(body) == {"message": "Unauthorized"}
+        assert not calls, "authorizer must not be invoked when the identity source is absent"
+    finally:
+        apigw_v1_mod._delete_rest_api(api_id)
+
+
+def test_apigwv1_token_authorizer_deny_403(monkeypatch):
+    from ministack.services import apigateway_v1 as apigw_v1_mod
+
+    async def fake_invoke(authorizer, event):
+        return _v1_authz_policy("Deny"), None, True
+
+    monkeypatch.setattr(apigw_v1_mod, "_invoke_authorizer", fake_invoke)
+    api_id = _v1_build_authz_api(apigw_v1_mod)
+    try:
+        status, _h, body = _v1_execute(apigw_v1_mod, api_id, {"host": "test", "authorization": "Bearer bad"})
+        assert status == 403
+        assert json.loads(body) == {"message": "User is not authorized to access this resource"}
+    finally:
+        apigw_v1_mod._delete_rest_api(api_id)
+
+
+def test_apigwv1_request_authorizer_context_maps_upstream_authorization(monkeypatch):
+    """The devbox partner-api shape: REQUEST authorizer validates x-api-key and
+    returns an access token in context; the HTTP_PROXY integration maps
+    context.authorizer.access_token into the upstream Authorization header."""
+    from ministack.services import apigateway as apigw_mod
+    from ministack.services import apigateway_v1 as apigw_v1_mod
+
+    seen_events = []
+
+    async def fake_invoke(authorizer, event):
+        seen_events.append(event)
+        return _v1_authz_policy("Allow", context={"access_token": "partner-token-123"}), None, True
+
+    captured = {}
+
+    def _capture(req, _timeout_seconds):
+        captured["url"] = req.full_url
+        captured["headers"] = {k.lower(): v for k, v in req.header_items()}
+        return 200, {"Content-Type": "application/json"}, b'{"ok": true}'
+
+    monkeypatch.setattr(apigw_v1_mod, "_invoke_authorizer", fake_invoke)
+    monkeypatch.setattr(apigw_mod, "_urlopen_sync", _capture)
+
+    api_id = _v1_build_authz_api(
+        apigw_v1_mod,
+        auth_type="REQUEST",
+        identity_source="method.request.header.x-api-key",
+        request_parameters={"integration.request.header.Authorization": "context.authorizer.access_token"},
+    )
+    try:
+        status, _h, _b = _v1_execute(apigw_v1_mod, api_id, {"host": "test", "x-api-key": "the-key"})
+        assert status == 200
+        assert captured["headers"].get("authorization") == "partner-token-123"
+        # inbound x-api-key still forwarded (AWS forwards unmapped headers on HTTP_PROXY)
+        assert captured["headers"].get("x-api-key") == "the-key"
+        # REQUEST authorizer event shape
+        event = seen_events[0]
+        assert event["type"] == "REQUEST"
+        assert event["headers"].get("x-api-key") == "the-key"
+        assert event["methodArn"].startswith("arn:aws:execute-api:")
+        assert f":{api_id}/test/GET/" in event["methodArn"]
+    finally:
+        apigw_v1_mod._delete_rest_api(api_id)
+
+
+def test_apigwv1_aws_proxy_receives_request_context_authorizer(monkeypatch):
+    from ministack.services import apigateway_v1 as apigw_v1_mod
+
+    async def fake_invoke(authorizer, event):
+        return _v1_authz_policy("Allow", context={"access_token": "tok", "tier": 3, "beta": True}), None, True
+
+    seen = {}
+
+    async def fake_call_lambda(func_name, event, qualifier=None):
+        seen["event"] = event
+        return {"statusCode": 200, "body": "{}"}, None
+
+    monkeypatch.setattr(apigw_v1_mod, "_invoke_authorizer", fake_invoke)
+    monkeypatch.setattr(apigw_v1_mod, "_call_lambda", fake_call_lambda)
+
+    api_id = _v1_build_authz_api(apigw_v1_mod, integration={
+        "type": "AWS_PROXY", "httpMethod": "POST",
+        "uri": ("arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+                "arn:aws:lambda:us-east-1:000000000000:function:backend/invocations"),
+    })
+    try:
+        status, _h, _b = _v1_execute(apigw_v1_mod, api_id, {"host": "test", "authorization": "Bearer ok"})
+        assert status == 200
+        authz = seen["event"]["requestContext"]["authorizer"]
+        assert authz["access_token"] == "tok"
+        assert authz["principalId"] == "user-1"
+        # AWS stringifies non-string context values
+        assert authz["tier"] == "3"
+        assert authz["beta"] == "true"
+    finally:
+        apigw_v1_mod._delete_rest_api(api_id)
+
+
+def test_apigwv1_http_proxy_static_and_header_request_parameters(monkeypatch):
+    """Header mappings must work without an authorizer too: static values and
+    method.request.header.* sources."""
+    from ministack.services import apigateway as apigw_mod
+    from ministack.services import apigateway_v1 as apigw_v1_mod
+
+    captured = {}
+
+    def _capture(req, _timeout_seconds):
+        captured["headers"] = {k.lower(): v for k, v in req.header_items()}
+        return 200, {"Content-Type": "application/json"}, b'{}'
+
+    monkeypatch.setattr(apigw_mod, "_urlopen_sync", _capture)
+
+    status, _h, body = apigw_v1_mod._create_rest_api({"name": "v1-hdr-map"})
+    api_id = json.loads(body)["id"]
+    try:
+        _s, _h, body = apigw_v1_mod._get_resources(api_id, {})
+        root = next(r for r in json.loads(body)["item"] if r["path"] == "/")
+        apigw_v1_mod._put_method(api_id, root["id"], "GET", {"authorizationType": "NONE"})
+        apigw_v1_mod._put_integration(api_id, root["id"], "GET", {
+            "type": "HTTP_PROXY", "httpMethod": "GET", "uri": "http://upstream.test/",
+            "requestParameters": {
+                "integration.request.header.X-Static": "'fixed-value'",
+                "integration.request.header.X-Copied": "method.request.header.x-orig",
+                "integration.request.header.Authorization": "'overwritten'",
+            },
+        })
+        apigw_v1_mod._create_deployment(api_id, {"stageName": "test"})
+
+        status, _h, _b = _v1_execute(apigw_v1_mod, api_id, {
+            "host": "test", "x-orig": "from-client", "authorization": "Bearer original",
+        })
+        assert status == 200
+        assert captured["headers"].get("x-static") == "fixed-value"
+        assert captured["headers"].get("x-copied") == "from-client"
+        # mapped header overwrites the inbound one
+        assert captured["headers"].get("authorization") == "overwritten"
+    finally:
+        apigw_v1_mod._delete_rest_api(api_id)
+
+
+def test_apigwv1_authorizer_result_cached_by_ttl(monkeypatch):
+    from ministack.services import apigateway_v1 as apigw_v1_mod
+
+    calls = []
+
+    async def fake_invoke(authorizer, event):
+        calls.append(1)
+        return _v1_authz_policy("Allow", context={"access_token": "tok"}), None, True
+
+    monkeypatch.setattr(apigw_v1_mod, "_invoke_authorizer", fake_invoke)
+
+    api_id = _v1_build_authz_api(apigw_v1_mod, ttl=300, integration={"type": "MOCK"})
+    try:
+        for _ in range(2):
+            status, _h, _b = _v1_execute(apigw_v1_mod, api_id, {"host": "test", "authorization": "Bearer same"})
+            assert status == 200
+        assert len(calls) == 1, "second request with the same token must hit the authorizer cache"
+    finally:
+        apigw_v1_mod._delete_rest_api(api_id)
+
+    calls.clear()
+    api_id = _v1_build_authz_api(apigw_v1_mod, ttl=0, integration={"type": "MOCK"})
+    try:
+        for _ in range(2):
+            _v1_execute(apigw_v1_mod, api_id, {"host": "test", "authorization": "Bearer same"})
+        assert len(calls) == 2, "ttl=0 disables the authorizer cache"
+    finally:
+        apigw_v1_mod._delete_rest_api(api_id)
+
+
+def test_apigwv1_authorizer_missing_lambda_fails_open(monkeypatch):
+    """When the authorizer's Lambda doesn't exist in ministack (common in
+    previews where auth is a deploy-time concern), the request passes through
+    instead of 500ing — preserves pre-existing permissive behavior."""
+    from ministack.services import apigateway_v1 as apigw_v1_mod
+
+    async def fake_invoke(authorizer, event):
+        return None, "authorizer Lambda 'authz-fn' not found", False
+
+    monkeypatch.setattr(apigw_v1_mod, "_invoke_authorizer", fake_invoke)
+    api_id = _v1_build_authz_api(apigw_v1_mod, integration={"type": "MOCK"})
+    try:
+        status, _h, _b = _v1_execute(apigw_v1_mod, api_id, {"host": "test", "authorization": "Bearer x"})
+        assert status == 200
+    finally:
+        apigw_v1_mod._delete_rest_api(api_id)
+
+
+def test_apigwv1_authorizer_invocation_error_500(monkeypatch):
+    from ministack.services import apigateway_v1 as apigw_v1_mod
+
+    async def fake_invoke(authorizer, event):
+        return None, "boom", True
+
+    monkeypatch.setattr(apigw_v1_mod, "_invoke_authorizer", fake_invoke)
+    api_id = _v1_build_authz_api(apigw_v1_mod, integration={"type": "MOCK"})
+    try:
+        status, _h, body = _v1_execute(apigw_v1_mod, api_id, {"host": "test", "authorization": "Bearer x"})
+        assert status == 500
+        # AWS 500 shape for authorizer configuration/invocation failures
+        assert json.loads(body) == {"message": None}
+    finally:
+        apigw_v1_mod._delete_rest_api(api_id)
+
+
+def test_apigwv1_http_proxy_stage_variables_request_parameter(monkeypatch):
+    from ministack.services import apigateway as apigw_mod
+    from ministack.services import apigateway_v1 as apigw_v1_mod
+
+    captured = {}
+
+    def _capture(req, _timeout_seconds):
+        captured["headers"] = {k.lower(): v for k, v in req.header_items()}
+        return 200, {"Content-Type": "application/json"}, b'{}'
+
+    monkeypatch.setattr(apigw_mod, "_urlopen_sync", _capture)
+
+    status, _h, body = apigw_v1_mod._create_rest_api({"name": "v1-stagevar-map"})
+    api_id = json.loads(body)["id"]
+    try:
+        _s, _h, body = apigw_v1_mod._get_resources(api_id, {})
+        root = next(r for r in json.loads(body)["item"] if r["path"] == "/")
+        apigw_v1_mod._put_method(api_id, root["id"], "GET", {"authorizationType": "NONE"})
+        apigw_v1_mod._put_integration(api_id, root["id"], "GET", {
+            "type": "HTTP_PROXY", "httpMethod": "GET", "uri": "http://upstream.test/",
+            "requestParameters": {"integration.request.header.X-Env": "stageVariables.environment"},
+        })
+        apigw_v1_mod._create_deployment(api_id, {"stageName": "test", "variables": {"environment": "preview-7"}})
+
+        status, _h, _b = _v1_execute(apigw_v1_mod, api_id, {"host": "test"})
+        assert status == 200
+        assert captured["headers"].get("x-env") == "preview-7"
+    finally:
+        apigw_v1_mod._delete_rest_api(api_id)
+
+
+def test_apigwv1_authorizer_cache_expires(monkeypatch):
+    from ministack.services import apigateway_v1 as apigw_v1_mod
+
+    calls = []
+
+    async def fake_invoke(authorizer, event):
+        calls.append(1)
+        return _v1_authz_policy("Allow"), None, True
+
+    monkeypatch.setattr(apigw_v1_mod, "_invoke_authorizer", fake_invoke)
+
+    api_id = _v1_build_authz_api(apigw_v1_mod, ttl=300, integration={"type": "MOCK"})
+    try:
+        _v1_execute(apigw_v1_mod, api_id, {"host": "test", "authorization": "Bearer same"})
+        assert len(calls) == 1
+        # Age the cached entry past its TTL and re-request: must re-invoke.
+        now = time.time()
+        for key, (expires, outcome) in list(apigw_v1_mod._authorizer_cache.items()):
+            apigw_v1_mod._authorizer_cache[key] = (now - 1, outcome)
+        _v1_execute(apigw_v1_mod, api_id, {"host": "test", "authorization": "Bearer same"})
+        assert len(calls) == 2, "expired cache entry must trigger a fresh authorizer invocation"
+    finally:
+        apigw_v1_mod._delete_rest_api(api_id)
