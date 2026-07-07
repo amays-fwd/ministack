@@ -42,6 +42,8 @@ _EXECUTE_API_RE = re.compile(
 )
 # AppSync Events realtime WebSocket: {apiId}.appsync-realtime-api.<anything>[:port].
 _APPSYNC_REALTIME_RE = re.compile(r"^([a-z0-9]+)\.appsync-realtime-api\.")
+# aws-sdk retry metadata header: "attempt=N; max=M" (all AWS SDKs send it).
+_SDK_ATTEMPT_RE = re.compile(r"\s*attempt=(\d+)")
 # IoT data plane WebSocket: anything containing ".iot." in the host header.
 # Match AWS-shaped IoT hosts only — `iot.<region>.<host>`,
 # `data-ats.iot.<region>.<host>`, `data.iot.<region>.<host>`, and the
@@ -1858,6 +1860,24 @@ async def app(scope, receive, send):
 
     request_id = str(uuid.uuid4())
 
+    # Retry forensics: AWS SDKs stamp every attempt with amz-sdk-invocation-id (stable across
+    # retries of one logical call) and amz-sdk-request ("attempt=N; max=M"). Logging attempts
+    # >= 2 pairs a retry with its original attempt server-side — the smoking gun for the
+    # dropped-response class, where a create's effect applied but its response died with the
+    # connection and the retry collides (409/AlreadyExists). Attempt 1 is not logged: steady
+    # state stays quiet. Observation only; nothing on the wire changes.
+    _sdk_request = headers.get("amz-sdk-request", "")
+    _attempt_m = _SDK_ATTEMPT_RE.match(_sdk_request)
+    if _attempt_m and int(_attempt_m.group(1)) > 1:
+        logger.warning(
+            "SDK retry attempt received: %s %s %s target=%s invocation-id=%s",
+            _sdk_request.strip(),
+            method,
+            path,
+            headers.get("x-amz-target", "-"),
+            headers.get("amz-sdk-invocation-id", "-"),
+        )
+
     # If a /_ministack/reset is in flight, wait for it to finish before
     # serving this request. The lock is uncontended in steady state
     # (acquire/release is near-free); during a reset, new requests block
@@ -1890,7 +1910,25 @@ async def app(scope, receive, send):
     ):
         return
 
-    await _send_response(send, *await _dispatch_service_request(method, path, headers, body, query_params, request_id))
+    response = await _dispatch_service_request(method, path, headers, body, query_params, request_id)
+    try:
+        await _send_response(send, *response)
+    except Exception:
+        # The handler COMPLETED — its effect (e.g. a create) is applied — but the response
+        # write failed (closed transport from a keep-alive race, or a send-path exception).
+        # HTTP/1.1 offers no resend; the client's SDK will retry and may collide with its own
+        # success. Log the full pairing context so any future occurrence is a grep, not a
+        # forensic reconstruction.
+        logger.exception(
+            "response write failed AFTER handler completion (client will retry an applied "
+            "call): %s %s status=%s target=%s invocation-id=%s sdk-request=%s",
+            method,
+            path,
+            response[0] if response else "-",
+            headers.get("x-amz-target", "-"),
+            headers.get("amz-sdk-invocation-id", "-"),
+            headers.get("amz-sdk-request", "-"),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2514,7 +2552,16 @@ def main():
 
         config = HypercornConfig()
         config.bind = [f"{bind_host}:{port}"]
-        config.keep_alive_timeout = 75
+        # The server must never close an idle connection before the client does: aws-sdk-go-v2's
+        # Transport reuses idle connections for up to 90s (IdleConnTimeout), so a 75s server
+        # timer had the server closing FIRST — a client that reuses the socket in that window
+        # sends a request whose effect applies but whose response dies with the connection, and
+        # the SDK's retry then collides with its own success (409/AlreadyExists; the exact drop
+        # class from devbox serverless create bursts, where pulumi's refresh→up phase gap idles
+        # connections straight into the 75s timer). 620s clears every AWS SDK's idle-reuse
+        # window (Go 90s is the longest) with the ALB convention's margin; real AWS endpoints
+        # likewise hold keep-alives far beyond client reuse windows.
+        config.keep_alive_timeout = int(os.environ.get("MINISTACK_KEEP_ALIVE_TIMEOUT", "620"))
         config.loglevel = LOG_LEVEL.upper()
 
         # USE_SSL=1 enables HTTPS — matches the behaviour previously provided
