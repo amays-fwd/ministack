@@ -2004,6 +2004,15 @@ def _update_authorizer(api_id, auth_id, data):
         return _v1_error("NotFoundException", "Invalid Authorizer identifier specified", 404)
     patch_ops = data.get("patchOperations", [])
     _apply_patch(authorizer, patch_ops)
+    # PATCH op values arrive as strings; the response shape requires NullableInteger for the
+    # TTL — echoing "300" fails SDK deserialization client-side despite the 200 (observed:
+    # pulumi aws@7.34.0 failing UpdateAuthorizer on exactly this).
+    ttl = authorizer.get("authorizerResultTtlInSeconds")
+    if isinstance(ttl, str):
+        try:
+            authorizer["authorizerResultTtlInSeconds"] = int(float(ttl))
+        except ValueError:
+            pass
     return _v1_response(authorizer)
 
 

@@ -2524,3 +2524,33 @@ def test_apigwv1_http_proxy_encodes_greedy_proxy_param(monkeypatch):
     assert status == 200
     # '/' stays literal across the greedy segment; everything else is encoded.
     assert seen["url"] == "http://upstream.test/a%20b/c"
+
+
+def test_apigwv1_update_authorizer_ttl_stays_integer(apigw_v1):
+    """PATCH values arrive as strings; the UpdateAuthorizer/GetAuthorizer response
+    shape requires NullableInteger for the TTL — a string "300" fails SDK
+    deserialization client-side despite the 200 (observed: pulumi failing an
+    authorizerResultTtlInSeconds-only update)."""
+    api_id = apigw_v1.create_rest_api(name="v1-auth-ttl-int")["id"]
+    auth_id = apigw_v1.create_authorizer(
+        restApiId=api_id,
+        name="ttl-auth",
+        type="REQUEST",
+        authorizerUri="arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:auth/invocations",
+        identitySource="method.request.header.x-api-key",
+        authorizerResultTtlInSeconds=0,
+    )["id"]
+
+    # boto3 itself would raise a deserialization error here if the echoed TTL were a string.
+    updated = apigw_v1.update_authorizer(
+        restApiId=api_id,
+        authorizerId=auth_id,
+        patchOperations=[
+            {"op": "replace", "path": "/authorizerResultTtlInSeconds", "value": "300"}
+        ],
+    )
+    assert updated["authorizerResultTtlInSeconds"] == 300
+
+    got = apigw_v1.get_authorizer(restApiId=api_id, authorizerId=auth_id)
+    assert got["authorizerResultTtlInSeconds"] == 300
+    apigw_v1.delete_rest_api(restApiId=api_id)
