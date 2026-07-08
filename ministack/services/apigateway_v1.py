@@ -1290,7 +1290,11 @@ async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_
     for dest, src in req_params.items():
         if dest.startswith("integration.request.path."):
             placeholder = "{" + dest[len("integration.request.path."):] + "}"
-            uri = uri.replace(placeholder, _resolve_mapping_source(src) or "")
+            # Percent-encode the substituted value (AWS forwards a VALID upstream URL and lets
+            # the backend judge the id): the ASGI layer hands the route a decoded path, so raw
+            # spaces/unicode/brackets here previously produced an invalid request line -> 502
+            # where real API Gateway yields the backend's 400/404.
+            uri = uri.replace(placeholder, urllib.parse.quote(_resolve_mapping_source(src) or "", safe=""))
         elif dest.startswith("integration.request.header."):
             value = _resolve_mapping_source(src)
             if value is not None:
@@ -1301,7 +1305,9 @@ async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_
                 query_appends.append((dest[len("integration.request.querystring."):], value))
 
     if "{proxy}" in uri:
-        uri = uri.replace("{proxy}", path_params.get("proxy", ""))
+        # Greedy {proxy+} spans segments: keep '/' literal, encode everything else (same
+        # AWS-parity rationale as the single-segment substitution above).
+        uri = uri.replace("{proxy}", urllib.parse.quote(path_params.get("proxy", ""), safe="/"))
 
     flat_query = []
     if query_params:

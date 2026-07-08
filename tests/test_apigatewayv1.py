@@ -2455,3 +2455,72 @@ def test_apigwv1_authorizer_cache_expires(monkeypatch):
         assert len(calls) == 2, "expired cache entry must trigger a fresh authorizer invocation"
     finally:
         apigw_v1_mod._delete_rest_api(api_id)
+
+
+def test_apigwv1_http_proxy_encodes_substituted_path_params(monkeypatch):
+    """AWS forwards a VALID upstream URL: path params (decoded by the ASGI layer)
+    are percent-encoded on substitution, so a malformed id (spaces/unicode/brackets)
+    reaches the backend as its 400/404 problem — not a ministack 502."""
+    import asyncio
+
+    from ministack.services import apigateway as apigw_mod
+    from ministack.services import apigateway_v1 as apigw_v1_mod
+
+    seen = {}
+
+    def _capture_urlopen(request_or_url, _timeout_seconds):
+        seen["url"] = getattr(request_or_url, "full_url", request_or_url)
+        return 404, {"Content-Type": "application/json"}, b"{}"
+
+    monkeypatch.setattr(apigw_mod, "_urlopen_sync", _capture_urlopen)
+
+    async def _run():
+        return await apigw_v1_mod._invoke_http_proxy_v1(
+            {
+                "uri": "http://upstream.test/businesses/{id}",
+                "requestParameters": {
+                    "integration.request.path.id": "method.request.path.id"
+                },
+            },
+            "/businesses/bad id",
+            "GET",
+            {},
+            None,
+            {},
+            path_params={"id": "bad id <☃>"},
+        )
+
+    status, _, _ = asyncio.run(_run())
+    assert status == 404
+    assert seen["url"] == "http://upstream.test/businesses/bad%20id%20%3C%E2%98%83%3E"
+
+
+def test_apigwv1_http_proxy_encodes_greedy_proxy_param(monkeypatch):
+    import asyncio
+
+    from ministack.services import apigateway as apigw_mod
+    from ministack.services import apigateway_v1 as apigw_v1_mod
+
+    seen = {}
+
+    def _capture_urlopen(request_or_url, _timeout_seconds):
+        seen["url"] = getattr(request_or_url, "full_url", request_or_url)
+        return 200, {"Content-Type": "application/json"}, b"{}"
+
+    monkeypatch.setattr(apigw_mod, "_urlopen_sync", _capture_urlopen)
+
+    async def _run():
+        return await apigw_v1_mod._invoke_http_proxy_v1(
+            {"uri": "http://upstream.test/{proxy}"},
+            "/a b/c",
+            "GET",
+            {},
+            None,
+            {},
+            path_params={"proxy": "a b/c"},
+        )
+
+    status, _, _ = asyncio.run(_run())
+    assert status == 200
+    # '/' stays literal across the greedy segment; everything else is encoded.
+    assert seen["url"] == "http://upstream.test/a%20b/c"
