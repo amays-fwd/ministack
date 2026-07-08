@@ -1491,8 +1491,11 @@ def test_apigwv1_execute_missing_stage_404(apigw_v1):
     assert exc.value.code == 404
     apigw_v1.delete_rest_api(restApiId=api_id)
 
-def test_apigwv1_execute_missing_method_405(apigw_v1):
-    """execute-api returns 405 when resource exists but method is not configured."""
+def test_apigwv1_execute_missing_method_403_missing_auth_token(apigw_v1):
+    """execute-api answers an unregistered method on an existing resource with AWS's
+    403 "Missing Authentication Token" — real REST API Gateway never returns 405
+    (observed live: backend-api-e2e Test_case_914 expects one of [401, 403, 404])."""
+    import json as _json
     import urllib.error as _urlerr
     import urllib.request as _urlreq
 
@@ -1515,7 +1518,8 @@ def test_apigwv1_execute_missing_method_405(apigw_v1):
     req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
     with pytest.raises(_urlerr.HTTPError) as exc:
         _urlreq.urlopen(req)
-    assert exc.value.code == 405
+    assert exc.value.code == 403
+    assert _json.loads(exc.value.read()) == {"message": "Missing Authentication Token"}
     apigw_v1.delete_rest_api(restApiId=api_id)
 
 def test_apigwv1_execute_lambda_arn_uri(apigw_v1, lam):

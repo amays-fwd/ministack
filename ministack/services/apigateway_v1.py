@@ -1075,11 +1075,13 @@ async def handle_execute(api_id, stage_name, method, path, headers, body, query_
     if not resource:
         return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Missing Authentication Token"}).encode()
 
-    # Look up method
+    # Look up method. AWS REST API Gateway answers an unregistered method on an existing
+    # resource with 403 "Missing Authentication Token" — the same (confusing) response as an
+    # unknown route — never 405 (observed: backend-api-e2e Test_case_914 expects [401,403,404]).
     resource_methods = resource.get("resourceMethods", {})
     method_obj = resource_methods.get(method) or resource_methods.get("ANY")
     if not method_obj:
-        return 405, {"Content-Type": "application/json"}, json.dumps({"message": "Method Not Allowed"}).encode()
+        return 403, {"Content-Type": "application/json"}, json.dumps({"message": "Missing Authentication Token"}).encode()
 
     integration = method_obj.get("methodIntegration")
     if not integration:
