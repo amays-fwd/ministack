@@ -67,6 +67,7 @@ Data plane:
   when api_id is found in _rest_apis.
 """
 
+from ministack import request_context
 import asyncio
 import base64
 import datetime
@@ -1057,8 +1058,18 @@ async def handle_execute(api_id, stage_name, method, path, headers, body, query_
     if not stage:
         return 404, {"Content-Type": "application/json"}, json.dumps({"message": f"Stage '{stage_name}' not found"}).encode()
 
-    # Match path against resource tree
-    segments = [s for s in path.strip("/").split("/") if s]
+    # Match path against resource tree. AWS splits the RAW path and decodes per segment, so a
+    # percent-encoded slash inside a path parameter stays INSIDE its segment (the backend gets
+    # to 404 it) instead of collapsing into a separator pre-match — ASGI's scope["path"] arrives
+    # decoded, which turned /accounts/{id}%2F into a clean {id} match answering 200 where AWS
+    # answers 404 (observed: backend-api-e2e character-encoding negatives). The dispatcher
+    # stashes the still-encoded execute path in request_context; absent (direct module calls,
+    # tests), the decoded path segments as before.
+    raw_exec = request_context.raw_execute_path.get("")
+    if raw_exec:
+        segments = [urllib.parse.unquote(s) for s in raw_exec.strip("/").split("/") if s]
+    else:
+        segments = [s for s in path.strip("/").split("/") if s]
     resource, path_params = _match_resource_tree(api_id, segments)
 
     if not resource:

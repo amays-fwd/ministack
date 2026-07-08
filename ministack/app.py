@@ -157,6 +157,7 @@ _NON_S3_VHOST_NAMES = frozenset({
     "inspector2",
 })
 
+from ministack import request_context
 from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.responses import _12_DIGIT_RE, set_request_account_id, set_request_region
@@ -1394,6 +1395,16 @@ async def _handle_execute_api_request(
                 method, api_id, tentative_stage, connection_id, body, headers
             )
         stage, execute_path = _resolve_stage_and_path(api_id, tentative_stage, execute_path)
+        # Raw-path twin of the parse above: the addressing prefix (api id, stage,
+        # _user_request_) never contains percent-encoding, so the same parser yields the
+        # still-encoded execute path for AWS-faithful per-segment routing (request_context).
+        raw_parsed = _parse_execute_api_url(host, request_context.raw_path.get("") or path)
+        if raw_parsed is not None:
+            _, _raw_tentative, _raw_exec = raw_parsed
+            _, _raw_exec = _resolve_stage_and_path(api_id, _raw_tentative, _raw_exec)
+            request_context.raw_execute_path.set(_raw_exec)
+        else:
+            request_context.raw_execute_path.set("")
         if api_id in _get_module("apigateway_v1")._rest_apis:
             return await _get_module("apigateway_v1").handle_execute(
                 api_id, stage, method, execute_path, headers, body, query_params
@@ -1848,6 +1859,10 @@ async def app(scope, receive, send):
 
     method = scope["method"]
     path = scope["path"]
+    _raw = scope.get("raw_path")
+    request_context.raw_path.set(
+        _raw.decode("latin-1") if isinstance(_raw, (bytes, bytearray)) else (_raw or path)
+    )
     query_string = scope.get("query_string", b"").decode("utf-8")
     query_params = parse_qs(query_string, keep_blank_values=True)
 

@@ -2554,3 +2554,46 @@ def test_apigwv1_update_authorizer_ttl_stays_integer(apigw_v1):
     got = apigw_v1.get_authorizer(restApiId=api_id, authorizerId=auth_id)
     assert got["authorizerResultTtlInSeconds"] == 300
     apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_encoded_slash_stays_inside_path_param(apigw_v1):
+    """AWS splits the RAW path and decodes per segment: /items/abc%2Fdef is ONE
+    {id} segment (routed, forwarded upstream to judge), while a real /items/abc/def
+    is two segments and no resource. ASGI's pre-decoded scope["path"] previously
+    collapsed the %2F before matching (observed: /accounts/{realid}%2F answering
+    200 with the clean id's payload)."""
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+
+    api_id = apigw_v1.create_rest_api(name="v1-enc-slash")["id"]
+    root = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+    items = apigw_v1.create_resource(restApiId=api_id, parentId=root["id"], pathPart="items")["id"]
+    item = apigw_v1.create_resource(restApiId=api_id, parentId=items, pathPart="{id}")["id"]
+    apigw_v1.put_method(restApiId=api_id, resourceId=item, httpMethod="GET", authorizationType="NONE")
+    apigw_v1.put_integration(
+        restApiId=api_id, resourceId=item, httpMethod="GET", type="MOCK",
+        integrationHttpMethod="GET", uri="",
+        requestTemplates={"application/json": '{"statusCode": 200}'},
+    )
+    apigw_v1.put_method_response(restApiId=api_id, resourceId=item, httpMethod="GET", statusCode="200")
+    apigw_v1.put_integration_response(
+        restApiId=api_id, resourceId=item, httpMethod="GET", statusCode="200",
+        selectionPattern="", responseTemplates={"application/json": '{"ok": true}'},
+    )
+    dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+    apigw_v1.create_stage(restApiId=api_id, stageName="test", deploymentId=dep_id)
+
+    base = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/test/items"
+
+    # Encoded slash stays INSIDE the parameter — one segment, matched and served.
+    with _urlreq.urlopen(f"{base}/abc%2Fdef") as resp:
+        assert resp.status == 200
+
+    # A real slash is a separator — two segments, no resource.
+    try:
+        with _urlreq.urlopen(f"{base}/abc/def") as resp:
+            status = resp.status
+    except _urlerr.HTTPError as e:
+        status = e.code
+    assert status == 404
+    apigw_v1.delete_rest_api(restApiId=api_id)
